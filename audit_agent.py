@@ -10,6 +10,7 @@ from typing import Any
 from dotenv import load_dotenv
 from deepagents import create_deep_agent
 from loguru import logger
+from src.telemetry import trace_event
 
 ROOT = Path(__file__).resolve().parent
 ENV_PATH = ROOT / ".env"
@@ -203,7 +204,9 @@ def load_model_name() -> str:
 
 def invoke_agent(prompt: str) -> str:
     agent = build_agent(load_model_name())
+    trace_event("agent_input", {"prompt": prompt})
     result = agent.invoke({"messages": [{"role": "user", "content": build_augmented_prompt(prompt)}]})
+    trace_event("agent_output", {"result": result})
     messages = result.get("messages", [])
     if not messages:
         return ""
