@@ -41,3 +41,16 @@ def test_build_augmented_prompt_includes_report_shape_for_known_vendor():
     assert "vendor_id" in prompt
     assert "penalty_amount_inr" in prompt
     assert "check_delivery_log(\"VEN-1000\")" in prompt
+
+
+def test_telemetry_proxy_is_active(monkeypatch):
+    calls = []
+
+    def mock_emit(name, payload):
+        calls.append((name, payload))
+
+    monkeypatch.setattr("src.telemetry.tracer.emit", mock_emit)
+    audit_agent.invoke_agent("Audit the account for Gujarat Steel Corp.")
+
+    assert any(c[0] == "agent_input" for c in calls)
+    assert any(c[0] == "agent_output" for c in calls)
