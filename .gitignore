@@ -3,3 +3,13 @@
 __pycache__/
 .pytest_cache/
 *.pyc
+*.db
+!ap_ledger.db
+*.log
+output.txt
+eval_full_output.txt
+eval_report.md
+execution.md
+dist/
+node_modules/
+.DS_Store

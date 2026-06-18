@@ -1,0 +1,27 @@
+[
+  {
+    "vendor_name": "Gujarat Steel Corp",
+    "expected_penalty": 500.0,
+    "comment": "Classic case: 5% penalty after 7 days late. Invoice: 10,000, Late: 8 days."
+  },
+  {
+    "vendor_name": "Kala Ltd",
+    "expected_penalty": 0.0,
+    "comment": "No penalty: Delivered on time or within 7-day grace period."
+  },
+  {
+    "vendor_name": "Srinivas Group",
+    "expected_penalty": 1200.0,
+    "comment": "Complex case: Tiered penalty or flat fee derived from contract."
+  },
+  {
+    "vendor_name": "Aurora LLC",
+    "expected_penalty": 0.0,
+    "comment": "Non-penalty case: Contract has no penalty clause for delivery."
+  },
+  {
+    "vendor_name": "Malhotra PLC",
+    "expected_penalty": 250.0,
+    "comment": "Daily penalty: 1% per day late after 3 days."
+  }
+]

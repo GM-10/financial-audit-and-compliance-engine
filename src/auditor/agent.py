@@ -5,22 +5,19 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from typing import Any
 
-from dotenv import load_dotenv
+from .config import settings
 from deepagents import create_deep_agent
 from loguru import logger
-from src.telemetry import trace_event
-from src.web_tools import fetch_contract_from_portal
+from .telemetry import trace_event, trace_tool
+from .web_tools import fetch_contract_from_portal
 from pydantic import BaseModel, Field
 
-ROOT = Path(__file__).resolve().parent
-ENV_PATH = ROOT / ".env"
-DEFAULT_MODEL = "openrouter:inclusionai/ring-2.6-1t:free"
-
-CONTRACTS_DIR = ROOT / "contracts"
-DB_PATH = ROOT / "ap_ledger.db"
-DELIVERY_LOG_PATH = ROOT / "warehouse_receipts_fy26.csv"
+# Configuration provided by settings module
 LEDGER_SCHEMA_HINT = (
     "Tables: Vendors, Invoices, Payments. Columns: Vendors(Vendor_ID, Vendor_Name, GSTIN, Address), "
     "Invoices(Invoice_ID, Vendor_ID, Amount, Invoice_Date, Status), "
@@ -39,13 +36,17 @@ PENALTY CALCULATION RULES:
 3. Apply the rate to the invoice amount based on the number of days late identified in the delivery log.
 4. If no penalty clause exists or conditions are not met, penalty_amount_inr should be 0.0.
 
+WORKFLOW AUTOMATION:
+If a penalty_amount_inr > 0 is found, you MUST use send_gmail_notification EXACTLY ONCE to email the vendor about the discrepancy. The purpose of this email is to immediately notify them and initiate the penalty recovery process. Once the notification tool has been called, immediately proceed to return your final report.
+
 Your final report must reflect the exact calculations derived from the contract text.
 """.strip()
 
 def _connect():
     import sqlite3
-    return sqlite3.connect(DB_PATH)
+    return sqlite3.connect(settings.DB_PATH)
 
+@trace_tool
 def query_ledger(sql: str) -> str:
     """Execute a read-only SQL query against the accounts payable ledger."""
     lowered = sql.strip().lower()
@@ -65,10 +66,11 @@ def query_ledger(sql: str) -> str:
             )
     return json.dumps([dict(row) for row in rows])
 
+@trace_tool
 def check_delivery_log(vendor_id: str) -> str:
     """Return warehouse receipt rows for a vendor without exposing unrelated rows."""
     import pandas as pd
-    frame = pd.read_csv(DELIVERY_LOG_PATH)
+    frame = pd.read_csv(settings.DELIVERY_LOG_PATH)
     rows = frame.loc[frame["Vendor_ID"] == vendor_id].copy()
     rows["days_late"] = (
         pd.to_datetime(rows["Actual_Delivery"]) - pd.to_datetime(rows["Expected_Delivery"])
@@ -78,35 +80,74 @@ def check_delivery_log(vendor_id: str) -> str:
 def read_contract(vendor_name: str) -> str:
     # Try different extensions: .txt, .pdf, .docx
     for ext in [".txt", ".pdf", ".docx"]:
-        filename = vendor_name.replace(" ", "_") + ext
-        path = CONTRACTS_DIR / filename
-        if path.exists():
-            if ext == ".txt":
-                return path.read_text(encoding="utf-8")
-            elif ext == ".pdf":
-                try:
-                    from pypdf import PdfReader
-                    reader = PdfReader(path)
-                    return "\\n".join([page.extract_text() for page in reader.pages])
-                except ImportError:
-                    return f"[Error: pypdf not installed. Cannot read PDF {path.name}]"
-            elif ext == ".docx":
-                try:
-                    import docx
-                    doc = docx.Document(path)
-                    return "\\n".join([p.text for p in doc.paragraphs])
-                except ImportError:
-                    return f"[Error: python-docx not installed. Cannot read DOCX {path.name}]"
+        # Try both base name and name with "_Contract" suffix
+        base_name = vendor_name.replace(" ", "_")
+        for name in [f"{base_name}{ext}", f"{base_name}_Contract{ext}"]:
+            path = settings.CONTRACTS_DIR / name
+            if path.exists():
+                if ext == ".txt":
+                    return path.read_text(encoding="utf-8")
+                elif ext == ".pdf":
+                    try:
+                        from pypdf import PdfReader
+                        reader = PdfReader(path)
+                        return "\\n".join([page.extract_text() for page in reader.pages])
+                    except ImportError:
+                        return f"[Error: pypdf not installed. Cannot read PDF {path.name}]"
+                elif ext == ".docx":
+                    try:
+                        import docx
+                        doc = docx.Document(path)
+                        return "\\n".join([p.text for p in doc.paragraphs])
+                    except ImportError:
+                        return f"[Error: python-docx not installed. Cannot read DOCX {path.name}]"
 
-    existing_files = [f.name for f in CONTRACTS_DIR.iterdir()]
-    raise FileNotFoundError(f"No contract found for {vendor_name} (.txt, .pdf, or .docx) at {CONTRACTS_DIR}. Existing files: {existing_files}")
+    # Fallback: Search for any file that contains the vendor name
+    for file in settings.CONTRACTS_DIR.iterdir():
+        if vendor_name.replace(" ", "_") in file.name:
+            if file.suffix == ".txt":
+                return file.read_text(encoding="utf-8")
+            # (Could add pdf/docx support here too)
 
+    existing_files = [f.name for f in settings.CONTRACTS_DIR.iterdir()]
+    raise FileNotFoundError(f"No contract found for {vendor_name} (.txt, .pdf, or .docx) at {settings.CONTRACTS_DIR}. Existing files: {existing_files}")
+
+@trace_tool
 def read_file(vendor_name: str) -> str:
     """Read a contract file (PDF, DOCX, or TXT) for a vendor by name."""
     try:
         return read_contract(vendor_name)
     except FileNotFoundError:
-        return f"Contract not found for vendor: {vendor_name}. Available contracts are in {CONTRACTS_DIR}"
+        return f"Contract not found for vendor: {vendor_name}. Available contracts are in {settings.CONTRACTS_DIR}"
+
+@trace_tool
+def send_gmail_notification(to_email: str, subject: str, body: str) -> str:
+    """Send an email notification to a vendor via Gmail. Use this to notify vendors of penalties."""
+    gmail_user = settings.gmail_user
+    gmail_pass = settings.gmail_app_password
+
+    if not gmail_user or not gmail_pass:
+        # If credentials aren't set, simulate the email for workshop demonstration
+        logger.warning(f"Gmail credentials missing. Simulated Email to {to_email}: {subject}")
+        return f"Simulated sending email to {to_email}. Ensure GMAIL_USER and GMAIL_APP_PASSWORD are in .env for real emails."
+
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = gmail_user
+        msg['To'] = to_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(gmail_user, gmail_pass)
+        text = msg.as_string()
+        server.sendmail(gmail_user, to_email, text)
+        server.quit()
+        return f"Successfully sent real email notification to {to_email}"
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+        return f"Error sending email: {str(e)}"
 
 def get_vendor_id(vendor_name: str) -> str:
     rows = json.loads(query_ledger(f"select Vendor_ID from Vendors where Vendor_Name = '{vendor_name}'"))
@@ -128,13 +169,23 @@ class AuditAgentService:
         self.agent = self._build_agent()
 
     def _load_model_name(self) -> str:
-        load_dotenv(ENV_PATH)
-        return os.getenv("OPENROUTER_MODEL") or os.getenv("MODEL_NAME") or DEFAULT_MODEL
+        model = settings.openrouter_model
+        if model.startswith("openrouter:"):
+            return model[len("openrouter:"):]
+        return model
 
     def _build_agent(self):
-        return create_deep_agent(
+        from langchain_openrouter import ChatOpenRouter
+        
+        # Instantiate model with lower max_tokens to avoid OpenRouter credit check failures
+        llm = ChatOpenRouter(
             model=self.model_name,
-            tools=[query_ledger, check_delivery_log, read_file, fetch_contract_from_portal],
+            max_tokens=4000
+        )
+        
+        return create_deep_agent(
+            model=llm,
+            tools=[query_ledger, check_delivery_log, read_file, fetch_contract_from_portal, send_gmail_notification],
             system_prompt=SYSTEM_PROMPT,
             response_format=DiscrepancyReport,
         )
@@ -158,34 +209,24 @@ class AuditAgentService:
         if vendor_name is None:
             return prompt
 
-        vendor_id = get_vendor_id(vendor_name)
-        invoices = query_ledger(
-            "select Invoice_ID, Vendor_ID, Amount, Invoice_Date, Status "
-            f"from Invoices where Vendor_ID = '{vendor_id}'"
-        )
-        deliveries = check_delivery_log(vendor_id)
+        try:
+            vendor_id = get_vendor_id(vendor_name)
+        except ValueError:
+            return prompt
+
         contract_text = read_contract(vendor_name)
+        
         return (
             f"{prompt}\n\n"
-            "LOCAL REFERENCE DATA\n"
-            f"Vendor: {vendor_name}\n"
-            f"Vendor ID: {vendor_id}\n"
-            f"DB Schema Hint: {LEDGER_SCHEMA_HINT} "
-            "Use Vendors.Vendor_ID to join Vendors and Invoices, then Payments.Invoice_ID to join Payments; there is no accounts_payable table.\n"
-            "Tool Guidance: query_ledger accepts read-only SELECT SQL. "
-            f"Use check_delivery_log(\"{vendor_id}\") for warehouse receipts and read_file(\"{vendor_name}\") for the contract.\n"
-            "Response Shape: return a DiscrepancyReport with vendor_id, vendor_name, invoice_amount, "
-            "days_late, penalty_amount_inr, and action_required.\n\n"
-            "Known-good SQL examples:\n"
-            f"- select Vendor_ID, Vendor_Name from Vendors where Vendor_Name = '{vendor_name}'\n"
-            f"- select Invoice_ID, Vendor_ID, Amount, Invoice_Date, Status from Invoices where Vendor_ID = '{vendor_id}'\n"
-            f"- select Payment_ID, Invoice_ID, Amount, Payment_Date from Payments where Invoice_ID = 'INV-2000'\n\n"
-            "Contract:\n"
-            f"{contract_text}\n\n"
-            "Invoice Rows:\n"
-            f"{invoices}\n\n"
-            "Delivery Rows:\n"
-            f"{deliveries}\n"
+            "CONTEXTUAL GUIDANCE\n"
+            f"Target Vendor: {vendor_name} (ID: {vendor_id})\n"
+            "To complete this audit, you should:\n"
+            f"1. Fetch invoices for Vendor ID {vendor_id} using query_ledger.\n"
+            f"2. Check delivery logs for Vendor ID {vendor_id} using check_delivery_log.\n"
+            f"3. Review the contract details provided below for penalty clauses.\n\n"
+            "DB Schema Hint: Tables: Vendors, Invoices, Payments. Columns: Vendors(Vendor_ID, Vendor_Name, GSTIN, Address), Invoices(Invoice_ID, Vendor_ID, Amount, Invoice_Date, Status), Payments(Payment_ID, Invoice_ID, Amount, Payment_Date).\n\n"
+            "CONTRACT TEXT:\n"
+            f"{contract_text}\n"
         )
 
     def invoke(self, prompt: str) -> tuple[DiscrepancyReport | str, str]:
@@ -201,33 +242,33 @@ class AuditAgentService:
         # Capture the reasoning chain (all messages except the final structured response)
         reasoning_chain = ""
         if messages:
-            reasoning_chain = "\\n".join([
-                f"{m.get('role', 'unknown')}: {m.get('content', '')}"
-                for m in messages[:-1]
-            ])
+            chain_parts = []
+            for m in messages[:-1]:
+                if isinstance(m, dict):
+                    role = m.get("role", m.get("type", "unknown"))
+                    content = m.get("content", "")
+                else:
+                    role = getattr(m, "type", getattr(m, "role", "unknown"))
+                    content = getattr(m, "content", "")
+                chain_parts.append(f"{role}: {content}")
+            reasoning_chain = "\\n".join(chain_parts)
+            trace_event("agent_reasoning", {"chain": reasoning_chain})
 
         if not messages:
             return "No response from agent.", ""
 
         final = messages[-1]
-        content = str(getattr(final, "content", final))
+        content = getattr(final, "content", final)
 
         if isinstance(content, DiscrepancyReport):
             trace_event("audit_complete", {"report": content.model_dump()})
             return content, reasoning_chain
 
-        try:
-            if hasattr(final, 'content') and isinstance(final.content, DiscrepancyReport):
-                report = final.content
-                trace_event("audit_complete", {"report": report.model_dump()})
-                return report, reasoning_chain
-            return content, reasoning_chain
-        except Exception:
-            return content, reasoning_chain
+        return str(content), reasoning_chain
 
 def run_self_check() -> str:
     service = AuditAgentService()
-    report = service.invoke("Audit Gujarat Steel Corp")
+    report, _ = service.invoke("Audit Gujarat Steel Corp")
     if isinstance(report, DiscrepancyReport):
         return report.model_dump_json(indent=2)
     return str(report)
@@ -243,5 +284,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     service = AuditAgentService()
-    print(service.invoke(args.prompt))
+    report, reasoning = service.invoke(args.prompt)
+    print(f"REPORT:\n{report}")
+    if reasoning:
+        print(f"\nREASONING:\n{reasoning}")
     return 0

@@ -1,4 +1,4 @@
-from audit_agent import main
+from src.auditor.agent import main
 
 
 if __name__ == "__main__":
